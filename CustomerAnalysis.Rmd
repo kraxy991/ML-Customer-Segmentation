@@ -1,0 +1,748 @@
+---
+title: "customerAnalysis"
+date: "12/7/2021"
+output: 
+  pdf_document: 
+    toc: yes
+    toc_depth: '4'
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE, cache=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Data Pre-processing
+#### Import data
+```{r}
+customer <- data.table::fread('Customer Personality Analysis.csv')
+customer <- data.frame(customer)
+
+# calculate age of customers, and delete Year_Birth
+customer['Age'] = as.numeric(2014-customer$Year_Birth)
+customer['Child'] <- as.factor(ifelse(customer$Kidhome + customer$Teenhome >= 1, 1, 0))
+customer$Dt_Customer <- as.Date(customer$Dt_Customer, "%d-%m-20%y")
+customer$Dt_Customer <- as.numeric(max(customer$Dt_Customer)-customer$Dt_Customer)
+customer$Income <- as.numeric(customer$Income)
+customer$Recency <- as.numeric(customer$Recency)
+
+# basic&2nCycle = 0, others = 1
+customer$Education <- as.factor(ifelse(customer$Education != 'Basic'&customer$Education!='2n Cycle',1,0))
+# married&together = 1, others = 0
+customer$Marital_Status <- as.factor(ifelse(customer$Marital_Status != "Together"&customer$Marital_Status!='Married', 0, 1))
+customer <- customer[c(-1, -2, -6, -7, -26, -27, -28)]
+```
+
+#### Set seed 123 and split data (prop=0.6
+```{r}
+library(recipes)
+set.seed(123)
+split <- rsample::initial_split(customer, prop=0.6)
+cs.train <- rsample::training(split)
+cs.test <- rsample::testing(split)
+dim(cs.train)
+```
+
+#### Check missing value, need to lump later
+```{r}
+sum(is.na(cs.train))
+```
+
+
+Feature Filtering.
+```{r}
+# filtering near zero variables and delete them from data.
+library(caret)
+library(dplyr)
+caret::nearZeroVar(cs.train, saveMetrics = TRUE) %>%
+  tibble::rownames_to_column() %>%
+  filter(nzv)
+```
+Combine customers' attributes
+```{r}
+names(customer)
+people_attrs <- names(customer)[c(23, 24, 1:5)]
+people_attrs
+```
+
+
+1. Response Variable: NumDealsPurchases
+```{r}
+library(recipes)
+data_deal <- cbind('NumDealsPurchases'= cs.train$NumDealsPurchases,cs.train[people_attrs])
+
+baked_deal <- recipe(NumDealsPurchases~., data = data_deal) %>%
+  step_impute_bag(people_attrs) %>%
+  #step_center(all_numeric(),-all_outcomes()) %>%
+  #step_scale(all_numeric(),-all_outcomes()) %>%
+  prep(training = data_deal, retain = TRUE) %>%
+  juice()
+#prepare_deal <- prep(simple_deal, training = data_deal)
+#baked_deal <- bake(prepare_deal, new_data = data_deal)
+baked_deal
+```
+
+2. Response Variable:NumWebPurchases
+```{r}
+data_web <- cbind('NumWebPurchases'= cs.train$NumWebPurchases,cs.train[people_attrs])
+
+baked_web <- recipe(NumWebPurchases~., data = data_web) %>%
+  step_impute_bag(people_attrs) %>%
+  step_center(all_numeric(),-all_outcomes()) %>%
+  step_scale(all_numeric(),-all_outcomes()) %>%
+  prep(training = data_web, retain = TRUE) %>%
+  juice()
+#prepare_web <- prep(simple_web, training = data_web)
+#baked_web <- bake(prepare_web, new_data = data_web)
+baked_web
+```
+
+3. Response Variable:NumCatalogPurchases
+```{r}
+data_cat <- cbind('NumCatalogPurchases'= cs.train$NumCatalogPurchases,cs.train[people_attrs])
+
+baked_cat <- recipe(NumCatalogPurchases~., data = data_cat) %>%
+  step_impute_bag(people_attrs) %>%
+  step_impute_bag(people_attrs) %>%
+  step_center(all_numeric(),-all_outcomes()) %>%
+  step_scale(all_numeric(),-all_outcomes()) %>%
+  prep(training = data_cat, retain = TRUE) %>%
+  juice()
+
+baked_cat
+```
+
+
+4. Response Variable:NumStorePurchases
+```{r}
+data_stor <- cbind('NumStorePurchases'= cs.train$NumStorePurchases,cs.train[people_attrs])
+
+baked_stor <- recipe(NumStorePurchases~., data = data_stor) %>%
+  step_impute_bag(people_attrs) %>%
+  step_center(all_numeric(),-all_outcomes()) %>%
+  step_scale(all_numeric(),-all_outcomes()) %>%
+  prep(training = data_stor, retain = TRUE) %>%
+  juice()
+
+baked_stor
+```
+
+### Start Tree Model Training
+
+#### 1. CART
+```{r, warning=FALSE, cache=TRUE}
+library(rpart)
+library(rpart.plot)
+library(ggplot2)
+library(vip)
+response_var <- names(cs.train)[12:15]
+baked_data = list(baked_deal,baked_web,baked_cat,baked_stor)
+try <- baked_data[[1]]
+channels <- list()
+for(i in c(2,3,4)){
+  channel <- train(
+    as.formula(paste(response_var[i],'~.')),
+    data = baked_data[[i]],
+    method = 'rpart',
+    trControl = trainControl(method = 'cv', number = 10),
+    tuneLength = 20
+  )
+  print(channel)
+  channels[[i]] <- channel
+}
+
+vip::vip(channels[[2]],num_features = 7,scale=TRUE)
+vip::vip(channels[[3]],num_features = 7,scale=TRUE)
+vip::vip(channels[[4]],num_features = 7,scale=TRUE)
+```
+```{r, cache=TRUE}
+library(rpart)
+library(rpart.plot)
+response_var <- names(cs.train)[12:15]
+baked_data = list(baked_deal,baked_web,baked_cat,baked_stor)
+
+channels <- list()
+for(i in c(2,3,4)){
+    input <- as.formula(paste(response_var[i],"~."))
+    channel <- rpart(formula = input,data = baked_data[[i]], control = rpart.control(cp=0.003, maxdepth = 8))
+    channels[[i]] <- channel
+    rpart.plot(channel)
+}
+```
+
+Plot CART trees with minimum RMSE
+```{r}
+library(rpart)
+library(rpart.plot)
+channel_web <- rpart(formula = as.formula(paste(response_var[2],"~.")) ,data = baked_data[[2]], control = rpart.control(cp=0.00783))
+rpart.plot(channel_web)
+
+channel_cat <- rpart(formula = as.formula(paste(response_var[3],"~.")) ,data = baked_data[[3]], control = rpart.control(cp=0.007141481))
+rpart.plot(channel_cat)
+
+channel_stor <- rpart(formula = as.formula(paste(response_var[4],"~.")) ,data = baked_data[[4]], control = rpart.control(cp=0.008240529))
+rpart.plot(channel_stor)
+```
+
+
+#### 2. Random Forest
+
+##### set up RF grid
+```{r}
+library(ranger)
+n_features <- 7
+
+rf.hyper_grid <- expand.grid(
+  mtry = floor(n_features * c(.05, .15, .25, .333, .4)),
+  min.node.size = c(1, 3, 5, 10), 
+  replace = c(TRUE, FALSE),                               
+  sample.fraction = c(.5, .63, .8),                       
+  rmse = NA                                               
+)
+```
+
+##### tune RF for web
+```{r, cache=TRUE, results='hide'}
+system.time(for(i in seq_len(nrow(rf.hyper_grid))) {
+  # fit model for ith hyperparameter combination
+  fit <- ranger(
+    formula         = baked_web$NumWebPurchases ~ ., 
+    data            = baked_web, 
+    mtry            = rf.hyper_grid$mtry[i],
+    min.node.size   = rf.hyper_grid$min.node.size[i],
+    replace         = rf.hyper_grid$replace[i],
+    sample.fraction = rf.hyper_grid$sample.fraction[i],
+    verbose         = FALSE,
+    seed            = 123,
+    respect.unordered.factors = 'order',
+  )
+  # export OOB error 
+  rf.hyper_grid$rmse[i] <- sqrt(fit$prediction.error)
+})
+```
+
+##### see the top 10 tuning result
+```{r}
+rf.hyper_grid %>%
+  arrange(rmse) %>%
+  head(10)
+```
+##### construct final web RF and plot
+```{r, results='hide'}
+library(randomForest)
+set.seed(123)
+rf_web_final <- randomForest(
+  formula = NumWebPurchases ~.,
+  data = baked_web,
+  mtry = 2,
+  min.node.size = 1,
+  replace = FALSE,
+  sample.fraction = 0.5
+)
+```
+
+```{r, cache=TRUE}
+library(vip)
+library(reprtree) # use devtools to install
+vip(rf_web_final)
+reprtree:::plot.getTree(rf_web_final, depth = 4, main = 'Web Purchases RF')
+```
+
+##### summarize profiles from plot
+```{r}
+-0.2345*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+-0.6302*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+-1.6676*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+-0.637*sd(cs.train$Age, na.rm = TRUE) + mean(cs.train$Age, na.rm = TRUE)
+1.5772*sd(cs.train$Recency, na.rm = TRUE) + mean(cs.train$Recency, na.rm = TRUE)
+```
+max value:7.455
+
+Profile of ideal customer purchased on Web
+income >= 45898.24
+martial_status = 1 (Not single/divorced)
+Recency >= 95.001
+
+
+
+##### tune cat RF
+```{r, results='hide'}
+rf.hyper_grid_cat <- expand.grid(
+  mtry = floor(n_features * c(.05, .15, .25, .333, .4)),
+  min.node.size = c(1, 3, 5, 10), 
+  replace = c(TRUE, FALSE),                               
+  sample.fraction = c(.5, .63, .8),                       
+  rmse = NA                                               
+)
+```
+
+
+```{r, cache=TRUE}
+system.time(for(i in seq_len(nrow(rf.hyper_grid_cat))) {
+  # fit model for ith hyperparameter combination
+  fit_cat <- ranger(
+    formula         = baked_cat$NumCatalogPurchases ~ ., 
+    data            = baked_cat, 
+    mtry            = rf.hyper_grid_cat$mtry[i],
+    min.node.size   = rf.hyper_grid_cat$min.node.size[i],
+    replace         = rf.hyper_grid_cat$replace[i],
+    sample.fraction = rf.hyper_grid_cat$sample.fraction[i],
+    verbose         = FALSE,
+    seed            = 123,
+    respect.unordered.factors = 'order',
+  )
+  # export OOB error 
+  rf.hyper_grid_cat$rmse[i] <- sqrt(fit_cat$prediction.error)
+})
+
+rf.hyper_grid_cat %>%
+  arrange(rmse) %>%
+  head(10)
+```
+
+##### construct final cat RF and plot
+```{r, results='hide'}
+set.seed(123)
+rf_cat_final <- randomForest(
+  formula = NumCatalogPurchases ~.,
+  data = baked_cat,
+  mtry = 2,
+  min.node.size = 1,
+  replace = FALSE,
+  sample.fraction = 0.63
+)
+```
+
+```{r, cache=TRUE}
+vip(rf_cat_final)
+reprtree:::plot.getTree(rf_cat_final, depth = 4, main = 'Catalog Purchases RF')
+```
+Max: 7.1250
+Profile of ideal customer purchasing on Catalog
+income >= 56593.52
+income >= 66478.47
+Age < 27.5
+
+```{r}
+0.1575*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+0.5198*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+-1.4709*sd(cs.train$Age, na.rm = TRUE) + mean(cs.train$Age, na.rm = TRUE)
+```
+
+
+##### tune store rf
+```{r, results='hide'}
+rf.hyper_grid_stor <- expand.grid(
+  mtry = floor(n_features * c(.05, .15, .25, .333, .4)),
+  min.node.size = c(1, 3, 5, 10), 
+  replace = c(TRUE, FALSE),                               
+  sample.fraction = c(.5, .63, .8),                       
+  rmse = NA                                               
+)
+```
+
+```{r, cache=TRUE}
+system.time(for(i in seq_len(nrow(rf.hyper_grid_stor))) {
+  # fit model for ith hyperparameter combination
+  fit_stor <- ranger(
+    formula         = baked_stor$NumStorePurchases ~ ., 
+    data            = baked_stor, 
+    mtry            = rf.hyper_grid_stor$mtry[i],
+    min.node.size   = rf.hyper_grid_stor$min.node.size[i],
+    replace         = rf.hyper_grid_stor$replace[i],
+    sample.fraction = rf.hyper_grid_stor$sample.fraction[i],
+    verbose         = FALSE,
+    seed            = 123,
+    respect.unordered.factors = 'order',
+  )
+  # export OOB error 
+  rf.hyper_grid_stor$rmse[i] <- sqrt(fit_stor$prediction.error)
+})
+
+rf.hyper_grid_stor %>%
+  arrange(rmse) %>%
+  head(10)
+```
+
+##### construct final store RF and plot
+```{r, results='hide'}
+set.seed(123)
+rf_stor_final <- randomForest(
+  formula = NumStorePurchases ~.,
+  data = baked_stor,
+  mtry = 2,
+  min.node.size = 3,
+  replace = FALSE,
+  sample.fraction = 0.8
+)
+```
+
+```{r plot, cache=TRUE}
+vip(rf_stor_final)
+reprtree:::plot.getTree(rf_stor_final, depth = 4, main = 'Store Purchases RF')
+```
+max: 9.077
+Profile of ideal customer purchasing on store:
+Income >= $54923.74
+Income < $128437.4
+Education = 1(not basic and 2n cycle)
+
+```{r}
+0.0963*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+2.7907*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+```
+
+#### 3. XGBoost
+
+##### set up tuning grid for web
+```{r, cache=TRUE}
+library(xgboost)
+library(DiagrammeR)
+response <- c('NumWebPurchases', 'NumCatalogPurchases', 'NumStorePurchases')
+
+xgb_tune_grid <- expand.grid(
+  eta = 0.01,
+  max_depth = 5,
+  min_child_weight = 3,
+  subsample = 0.5,
+  colsample_bytree = 0.5,
+  gamma = c(0, 1, 10,100,1000),
+  lambda = c(0, 1e-2,0.1, 1, 100, 1000,10000),
+  alpha = c(0, 1e-2, 0.1, 1, 100, 1000,10000),
+  rmse = 0,
+  trees = 0
+)
+```
+
+##### tune xgb for web
+```{r, warning=FALSE, cache=TRUE, results='hide'}
+system.time(for(i in seq_len(nrow(xgb_tune_grid))){
+  set.seed(123)
+  n <- xgb.cv(
+    data = data.matrix(baked_data[[2]][setdiff(names(baked_data[[2]]), response[1])]),
+    label = baked_data[[2]]$NumWebPurchases,
+    nrounds = 5000,
+    objective = 'reg:squarederror',
+    early_stopping_rounds = 50,
+    nfold = 10,
+    verbose = 0,
+    params = list(
+      eta = xgb_tune_grid$eta[i],
+      max_depth = xgb_tune_grid$max_depth[i],
+      min_child_weight = xgb_tune_grid$min_child_weight[i],
+      subsample = xgb_tune_grid$subsample[i],
+      colsample_bytree = xgb_tune_grid$colsample_bytree[i],
+      gamma = xgb_tune_grid$gamma[i],
+      lambda = xgb_tune_grid$lambda[i],
+      alpha = xgb_tune_grid$alpha[i]
+    )
+  )
+  xgb_tune_grid$rmse[i] <- min(n$evaluation_log$test_rmse_mean)
+  xgb_tune_grid$trees[i] <- n$best_iteration
+}
+)
+```
+
+##### see tuning results of web
+```{r}
+library(dplyr)
+xgb_tune_grid %>%
+  arrange(rmse) %>%
+  head(10)
+```
+
+##### construct final xgb model for web and plot trees
+```{r, results='hide'}
+library(xgboost)
+set.seed(123)
+xgb_web_final <- xgboost(
+  data = data.matrix(baked_data[[2]][setdiff(names(baked_data[[2]]), response[1])]),
+  label = baked_data[[2]]$NumWebPurchases,
+  max_depth = 5,
+  eta = 0.01,
+  min_child_weight = 3,
+  subsample = 0.5,
+  colsample_bytree = 0.5,
+  gamma = 1,
+  lambda = 100,
+  alpha = 0.01,
+  nrounds = 1207,
+  objective = 'reg:squarederror'
+)
+```
+
+
+```{r}
+library(vip)
+vip(xgb_web_final)
+xgb_web_plot <- xgb.plot.tree(model = xgb_web_final, trees = 3, show_node_id = TRUE)
+xgb_web_plot
+```
+
+```{r}
+-0.442*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+3.004*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+```
+
+Largest value: 0.0365
+Profile of ideal customer purchasing on Web(XGB)
+Income >= $40236.83
+Income < $134257.1
+
+##### set up tune grid for catalog
+```{r}
+xgb_tune_grid_cat <- expand.grid(
+  eta = 0.01,
+  max_depth = 10,
+  min_child_weight = 3,
+  subsample = 0.5,
+  colsample_bytree = 0.5,
+  gamma = c(0, 1, 10,100,1000),
+  lambda = c(0, 1e-2, 1, 100,10000),
+  alpha = c(0, 1e-2, 1, 100,10000),
+  rmse = 0,
+  trees = 0
+)
+
+```
+
+##### tune catalog xgb
+```{r, cache=TRUE, results='hide'}
+system.time(for(i in seq_len(nrow(xgb_tune_grid_cat))){
+  set.seed(123)
+  n_cat <- xgb.cv(
+    data = data.matrix(baked_data[[3]][setdiff(names(baked_data[[3]]), response[2])]),
+    label = baked_data[[3]]$NumCatalogPurchases,
+    nrounds = 4000,
+    objective = 'reg:squarederror',
+    early_stopping_rounds = 50,
+    nfold = 10,
+    verbose = 0,
+    params = list(
+      eta = xgb_tune_grid_cat$eta[i],
+      max_depth = xgb_tune_grid_cat$max_depth[i],
+      min_child_weight = xgb_tune_grid_cat$min_child_weight[i],
+      subsample = xgb_tune_grid_cat$subsample[i],
+      colsample_bytree = xgb_tune_grid_cat$colsample_bytree[i],
+      gamma = xgb_tune_grid_cat$gamma[i],
+      lambda = xgb_tune_grid_cat$lambda[i],
+      alpha = xgb_tune_grid_cat$alpha[i]
+    )
+  )
+  xgb_tune_grid_cat$rmse[i] <- min(n_cat$evaluation_log$test_rmse_mean)
+  xgb_tune_grid_cat$trees[i] <- n_cat$best_iteration
+}
+)
+```
+
+##### see tuning result of catalog
+```{r}
+xgb_tune_grid_cat %>%
+  arrange(rmse) %>%
+  head(10)
+```
+
+##### construct final catalog xgb and plot trees
+```{r, results='hide'}
+set.seed(123)
+xgb_cat_final <- xgboost(
+  data = data.matrix(baked_data[[3]][setdiff(names(baked_data[[3]]), response[2])]),
+  label = baked_data[[3]]$NumCatalogPurchases,
+  max_depth = 10,
+  eta = 0.01,
+  min_child_weight = 3,
+  subsample = 0.5,
+  colsample_bytree = 0.5,
+  gamma = 10,
+  lambda = 100,
+  alpha = 0.01,
+  nrounds = 1506,
+  objective = 'reg:squarederror'
+)
+```
+
+
+```{r}
+vip(xgb_cat_final)
+xgb_cat_plot <- xgb.plot.tree(model = xgb_cat_final, trees=3, show_node_id = TRUE)
+xgb_cat_plot
+```
+largest value:  0.0325
+Profile of ideal customer purchasing on Catalog(XGB)
+Income >= $49436.96
+Income < $108239.2
+Income >= $56702.65
+```{r}
+-0.1048*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+2.0504*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+0.1615*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+```
+
+
+##### set up grid for store
+```{r}
+xgb_tune_grid_stor <- expand.grid(
+  eta = 0.01,
+  max_depth = 5,
+  min_child_weight = 3,
+  subsample = 0.5,
+  colsample_bytree = 0.5,
+  gamma = c(1, 10,100,1000),
+  lambda = c(1e-2, 1, 100, 1000,10000),
+  alpha = c(1e-2, 1, 100, 1000,10000),
+  rmse = 0,
+  trees = 0
+)
+```
+
+##### tune store xgb
+```{r, cache=TRUE, results='hide'}
+system.time(for(i in seq_len(nrow(xgb_tune_grid_stor))){
+  set.seed(123)
+  n_stor <- xgb.cv(
+    data = data.matrix(baked_data[[4]][setdiff(names(baked_data[[4]]), response[3])]),
+    label = baked_data[[4]]$NumStorePurchases,
+    nrounds = 4000,
+    objective = 'reg:squarederror',
+    early_stopping_rounds = 50,
+    nfold = 10,
+    verbose = 0,
+    params = list(
+      eta = xgb_tune_grid_stor$eta[i],
+      max_depth = xgb_tune_grid_stor$max_depth[i],
+      min_child_weight = xgb_tune_grid_stor$min_child_weight[i],
+      subsample = xgb_tune_grid_stor$subsample[i],
+      colsample_bytree = xgb_tune_grid_stor$colsample_bytree[i],
+      gamma = xgb_tune_grid_stor$gamma[i],
+      lambda = xgb_tune_grid_stor$lambda[i],
+      alpha = xgb_tune_grid_stor$alpha[i]
+    )
+  )
+  xgb_tune_grid_stor$rmse[i] <- min(n_stor$evaluation_log$test_rmse_mean)
+  xgb_tune_grid_stor$trees[i] <- n_stor$best_iteration
+}
+)
+```
+
+##### see tuning resul of store xgb
+```{r}
+xgb_tune_grid_stor %>%
+  arrange(rmse) %>%
+  head(10)
+```
+
+##### construct final store xgb and plot trees
+```{r, warning=FALSE, cache=TRUE, results='hide'}
+xgb_stor_final <- xgboost(
+  data = data.matrix(baked_data[[4]][setdiff(names(baked_data[[4]]), response[3])]),
+  label = baked_data[[4]]$NumStorePurchases,
+  max_depth = 5,
+  eta = 0.01,
+  min_child_weight = 3,
+  subsample = 0.5,
+  colsample_bytree = 0.5,
+  gamma = 1,
+  lambda = 100,
+  alpha = 0.01,
+  nrounds = 1472,
+  objective = 'reg:squarederror'
+)
+```
+
+
+```{r, warning=FALSE}
+vip(xgb_stor_final)
+xgb_stor_plot <- xgb.plot.tree(model = xgb_stor_final, trees =5, show_node_id = TRUE)
+xgb_stor_plot
+```
+
+largest value: 0.05216
+Profile of ideal customer purchasing on Store
+Income >= $41895.69
+Income < $106539.4
+```{r}
+-0.3812*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+1.9881*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+```
+
+
+#### Predict on test data
+##### RF
+```{r}
+set.seed(1234)
+web_rf_pred <- predict(rf_web_final, newdata = cs.test, type = 'response')
+sqrt(mean((web_rf_pred - cs.test$NumWebPurchases)^2, na.rm = TRUE))
+```
+
+```{r}
+set.seed(1234)
+cat_rf_pred <- predict(rf_cat_final, newdata = cs.test, type = 'response')
+sqrt(mean((cat_rf_pred - cs.test$NumCatalogPurchases)^2, na.rm = TRUE))
+```
+
+```{r}
+stor_rf_pred <- predict(rf_stor_final, newdata = cs.test, type = 'response')
+sqrt(mean((stor_rf_pred - cs.test$NumStorePurchases)^2, na.rm = TRUE))
+```
+
+#### Summarize profiles from tree plots
+
+Profile of ideal customer purchasing on Catalog:
+
+Largest value : 6.3/12%
+Income >= $76851.8
+recency < 92.76779 days
+Income < $98678
+
+2nd largest value: 8/1%
+Income >= $76851.8
+recency >= 92.76779 days
+```{r}
+0.9*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+1.5*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+1.7*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+1.5*sd(cs.train$Recency, na.rm = TRUE) + mean(cs.train$Recency, na.rm = TRUE)
+```
+
+Profile of ideal customer purchasing on Web(cart)
+
+largest value: 7.4/1%
+Income >= $49295.08
+Dt_customer < 423.4707
+Income >= $55570.37
+Age >= 67.9
+
+2nd largest value: 6.9/4%
+Income >= $49295.08
+Dt_customer < 423.4707
+Income >= $55570.37
+Age < 67.9
+child = 1(have child or teen)
+Income >= $67575.28
+Income > $82308.57
+```{r}
+-0.11*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+0.35*sd(cs.train$Dt_Customer, na.rm = TRUE) + mean(cs.train$Dt_Customer, na.rm = TRUE)
+0.12*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+1.9*sd(cs.train$Age, na.rm = TRUE) + mean(cs.train$Age, na.rm = TRUE)
+0.56*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+1.1*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+```
+
+
+Profile of ideal customer purchasing on Store(cart)
+
+largest value: 8.4/36%
+Income >= $51450.51
+Income >= $60481.47
+Income < $101407.3
+
+2nd largest value: 6.8/13%
+Income >= $51450.51
+Income < $60481.47
+```{r}
+-0.031*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+0.3*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+1.8*sd(cs.train$Income, na.rm = TRUE) + mean(cs.train$Income, na.rm = TRUE)
+```
+
