@@ -3,6 +3,6 @@ Data from kaggle, customer segmentation focused on purchasing channels. Part of 
 
 Data source: https://www.kaggle.com/imakash3011/customer-personality-analysis
 
-The goal is to classify customers focused on their purchasing channels. 
+The goal is to classify customers based on their purchasing channels. 
 
-In the data, using recipes to pre-process data, using 3 tree models(CART, RF and XGB) to conduct unsupervised learning on processed data. Trees were plotted.
+Using recipes to pre-process data, using 3 tree models(CART, RF and XGB) to conduct unsupervised learning on processed data. Trees were plotted.
